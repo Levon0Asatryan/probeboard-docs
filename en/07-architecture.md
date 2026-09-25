@@ -215,7 +215,10 @@ CREATE TABLE probe_stats (
     count_degraded    integer NOT NULL DEFAULT 0,
     count_unknown     integer NOT NULL DEFAULT 0,
     count_maintenance integer NOT NULL DEFAULT 0,
+    -- Seconds observed: up + down + degraded. An unknown probe adds none.
     covered_seconds   integer NOT NULL DEFAULT 0,   -- time-weighted uptime (§3.5.1)
+    up_seconds        integer NOT NULL DEFAULT 0,
+    degraded_seconds  integer NOT NULL DEFAULT 0,
     sum_total_ms      bigint  NOT NULL DEFAULT 0,
     min_total_ms      integer,
     max_total_ms      integer,
@@ -233,41 +236,90 @@ p95 is linear interpolation inside the containing bucket. Buckets merge by
 integer addition, so minute → hour → day rollup is associative and exact
 (§3.6). The same array renders as the latency heatmap.
 
-Both count- and time-weighted uptime are derivable, because both
-`count_*` and `covered_seconds` are stored — §3.5.1's comparison becomes a query,
-not a redesign.
+Both count- and time-weighted uptime are derivable, because the `count_*`
+columns and the seconds columns are both stored — §3.5.1's comparison becomes a
+query, not a redesign. `covered_seconds` alone is not enough for the
+time-weighted form: it is the denominator, and the numerator needs
+`up_seconds` (and `degraded_seconds`, once M6 writes `degraded`) held
+separately, because the counts cannot supply it when an endpoint's interval
+changed inside the window.
+
+Seconds are attributed whole to the bucket holding `started_at`, so a window
+shorter than the longest interval in it does not get a meaningful time-weighted
+answer. M5 states that limit rather than interpolating across bucket edges.
 
 ### The rollup must be atomic
 
 The second Uptime Kuma defect (§4.2) is read-modify-write in application code.
 probeboard increments inside the database:
 
+The fold aggregates a batch of raw rows into one row per bucket in SQL, and adds
+that row to whatever is already stored:
+
 ```sql
 INSERT INTO probe_stats AS s (endpoint_id, granularity, bucket_start,
-                              count_up, covered_seconds, sum_total_ms,
-                              min_total_ms, max_total_ms, hist_total)
-VALUES ($1, 'm1', date_trunc('minute', $2), 1, $3, $4, $4, $4,
-        array_fill(0, ARRAY[20]))
+                              count_up, covered_seconds, up_seconds,
+                              sum_total_ms, min_total_ms, max_total_ms,
+                              hist_total)
+SELECT endpoint_id, 'm1', date_trunc('minute', started_at),
+       count(*) FILTER (WHERE outcome = 'up'),
+       coalesce(sum(interval_s) FILTER
+                (WHERE outcome IN ('up','down','degraded')), 0)::int,
+       coalesce(sum(interval_s) FILTER (WHERE outcome = 'up'), 0)::int,
+       coalesce(sum(total_ms), 0), min(total_ms), max(total_ms),
+       <the batch's own 20-element histogram>
+FROM   new_rows
+GROUP  BY endpoint_id, date_trunc('minute', started_at)
 ON CONFLICT (endpoint_id, granularity, bucket_start) DO UPDATE SET
-    count_up        = s.count_up        + 1,
+    count_up        = s.count_up        + EXCLUDED.count_up,
     covered_seconds = s.covered_seconds + EXCLUDED.covered_seconds,
+    up_seconds      = s.up_seconds      + EXCLUDED.up_seconds,
     sum_total_ms    = s.sum_total_ms    + EXCLUDED.sum_total_ms,
     min_total_ms    = least(s.min_total_ms, EXCLUDED.min_total_ms),
     max_total_ms    = greatest(s.max_total_ms, EXCLUDED.max_total_ms),
-    hist_total[$5]  = s.hist_total[$5] + 1;
+    hist_total      = ARRAY(SELECT a + b
+                            FROM unnest(s.hist_total, EXCLUDED.hist_total)
+                                 WITH ORDINALITY AS h(a, b, ord)
+                            ORDER BY ord);
 ```
 
 No row is ever read into a worker and written back, so concurrent workers cannot
 lose an update (review rule g15).
 
+**Every column must be folded the same way on both paths.** An earlier version
+of this snippet inserted `array_fill(0, ARRAY[20])` and incremented
+`hist_total[$k]` only in the `DO UPDATE` branch, which silently dropped the
+first probe of every bucket from the histogram — the insert path wrote a zero
+vector and nothing ever added that probe back. The rule the shape enforces:
+whatever the `VALUES`/`SELECT` side contributes, `DO UPDATE` adds the same
+thing to what is stored, so the two paths differ only in what they start from.
+Merging the whole array elementwise, rather than touching one index, makes that
+symmetry hard to break.
+
 ### Idempotency
 
-The rollup is driven off a watermark per endpoint, and every probe result has a
-natural key `(endpoint_id, started_at)`. A retried rollup batch re-reads the
-same rows; the watermark advances only on commit, in the same transaction as the
-upserts. Re-running a batch is therefore safe but not free — so the watermark
-and upserts share one transaction, making the whole step exactly-once in effect
-(review rule g13).
+The rollup is driven off a single watermark over **transaction ids**, not over
+time, and the fold and the watermark advance commit together — so the step is
+exactly-once in effect (review rule g13).
+
+A timestamp watermark loses data, and M5 demonstrated it rather than reasoning
+about it. `started_at` is set before the probe runs and the row commits some
+time later, so two writers can commit out of order: a pass that folds
+everything up to time *T* and stores *T* will never look below *T* again, and a
+row with `started_at < T` that commits afterwards is skipped for ever. The
+window is exactly the probe's own duration, so the rows most likely to be lost
+are the slow ones — the outages.
+
+Instead every `probe_results` row carries `insert_xid xid8 DEFAULT
+pg_current_xact_id()`, and a pass folds `insert_xid` in `[last_xid, horizon)`
+where the horizon is `pg_snapshot_xmin(pg_current_snapshot())`, read once per
+pass. Below that horizon no transaction is still in flight, so no row can
+appear later beneath a watermark that has already passed it. `xid8` rather than
+`xid` because it does not wrap.
+
+The natural key stays `(endpoint_id, started_at, attempt_id)`: a retry of one
+attempt's write is idempotent under `ON CONFLICT DO NOTHING`, while a second
+attempt in the same millisecond is legitimately its own row.
 
 ### endpoint_runtime
 
