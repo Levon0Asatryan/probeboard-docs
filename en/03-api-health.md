@@ -119,21 +119,36 @@ full set, with the concrete signals that produce it in a Node probe executor.
 
 | Class | Dimension | Node signal | Operational meaning |
 |---|---|---|---|
-| `DNS_NXDOMAIN` | H1 | `ENOTFOUND` | name does not exist — usually config, not outage |
-| `DNS_FAILURE` | H1 | `EAI_AGAIN` | resolver itself is failing |
+| `DNS_NXDOMAIN` | H1 | `ENOTFOUND` (`getaddrinfo`); `ENOTFOUND`, `ENODATA` (c-ares) | name does not exist — usually config, not outage |
+| `DNS_FAILURE` | H1 | `EAI_AGAIN` (`getaddrinfo`); `ESERVFAIL`, `EREFUSED`, `ETIMEOUT`, `ECONNREFUSED`, `EBADRESP`, `ENOTIMP`, `EFORMERR` (c-ares) | resolver itself is failing |
 | `CONNECTION_REFUSED` | H1 | `ECONNREFUSED` | host up, nothing listening — process is down |
-| `CONNECTION_TIMEOUT` | H1 | `UND_ERR_CONNECT_TIMEOUT`, `ETIMEDOUT` | packets dropped — firewall or dead host |
-| `CONNECTION_RESET` | H1 | `ECONNRESET`, `EPIPE` | peer killed the connection mid-flight |
+| `CONNECTION_TIMEOUT` | H1 | `UND_ERR_CONNECT_TIMEOUT`, `ETIMEDOUT`, `EHOSTUNREACH`, `ENETUNREACH` | packets dropped or rejected — firewall or dead host |
+| `CONNECTION_RESET` | H1 | `ECONNRESET`, `EPIPE`, `UND_ERR_SOCKET` | peer killed the connection mid-flight |
 | `TLS_EXPIRED` | H1/H6 | `CERT_HAS_EXPIRED` | certificate lapsed — foreseeable, therefore preventable |
-| `TLS_UNTRUSTED` | H1 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `DEPTH_ZERO_SELF_SIGNED_CERT` | chain incomplete or self-signed |
+| `TLS_UNTRUSTED` | H1 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | chain incomplete or self-signed |
 | `TLS_HOSTNAME_MISMATCH` | H1 | `ERR_TLS_CERT_ALTNAME_INVALID` | certificate is for a different name |
-| `TLS_HANDSHAKE_FAILED` | H1 | `EPROTO` | protocol/cipher mismatch |
+| `TLS_HANDSHAKE_FAILED` | H1 | `EPROTO`, any `ERR_SSL_*` | protocol/cipher mismatch |
 | `RESPONSE_TIMEOUT` | H2 | `UND_ERR_HEADERS_TIMEOUT` | connected, server never answered |
 | `BODY_TIMEOUT` | H2 | `UND_ERR_BODY_TIMEOUT` | headers arrived, body stalled |
 | `STATUS_MISMATCH` | H2 | status ∉ accepted set | the endpoint answered, with the wrong answer |
 | `ASSERTION_FAILED` | H3 | assertion evaluation | the payload is wrong |
 | `TOO_MANY_REDIRECTS` | H2 | redirect budget exhausted | redirect loop |
 | `BLOCKED_BY_POLICY` | — | SSRF guard (NFR-11) | *probeboard refused*, not an endpoint failure |
+
+**Two resolvers, two vocabularies.** An unguarded probe resolves through
+`dns.lookup`, which is `getaddrinfo`; the SSRF guard resolves every A and AAAA
+record through `resolve4`/`resolve6`, which is c-ares. They report the same
+failures with different codes — c-ares never produces `EAI_AGAIN` — so each is
+read through its own table. In particular, c-ares' `ECONNREFUSED` means *the
+resolver* refused the query, not the endpoint, and never maps to
+`CONNECTION_REFUSED`. A code on neither list stays `UNKNOWN_ERROR` with the
+code preserved: mapping a documented code reads the signal; mapping an
+unrecognised one would invent a diagnosis.
+
+`EHOSTUNREACH` and `ENETUNREACH` are the dropped-packet case reported actively
+(an ICMP unreachable or a `REJECT` rule rather than a `DROP`), so a firewall's
+choice between the two must not change the class. The same address measured
+`EHOSTUNREACH` on macOS and `ENETUNREACH` on Linux, so both are listed.
 
 Two design points here matter more than the list itself:
 
